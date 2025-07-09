@@ -1,0 +1,130 @@
+#pragma kernel CSMain
+
+struct Source {
+    float3 position;
+    float radius;
+};
+
+struct Triangle {
+    float3 posA, posB, posC;
+    float3 normalA, normalB, normalC;
+};
+
+struct Ray {
+    float3 origin;
+    float3 dir;
+};
+
+struct Hit {
+    bool hit;
+    float dst;
+    float3 hitPoint;
+    float3 normal;
+};
+
+struct BVHNode {
+    float3 min;
+    float3 max;
+    int index;
+    int triangleCount;
+};
+
+StructuredBuffer<Source> sourceBuffer;
+StructuredBuffer<BVHNode> bvhBuffer;
+StructuredBuffer<Triangle> triangleBuffer;
+int numSources;
+int numBVHNodes;
+float3 listenerPos;
+float listenerOffset;
+float sourceOffset;
+
+RWStructuredBuffer<int> directResultBuffer;
+
+Hit intersectTriangle(Ray ray, Triangle tri)
+{
+    float3 edgeAB = tri.posB - tri.posA;
+    float3 edgeAC = tri.posC - tri.posA;
+    float3 normalVector = cross(edgeAB, edgeAC);
+    float3 ao = ray.origin - tri.posA;
+    float3 dao = cross(ao, ray.dir);
+
+    float determinant = -dot(ray.dir, normalVector);
+    float invDet = 1 / determinant;
+
+    // Calculate dst to triangle & barycentric coordinates of intersection point
+    float dst = dot(ao, normalVector) * invDet;
+    float u = dot(edgeAC, dao) * invDet;
+    float v = -dot(edgeAB, dao) * invDet;
+    float w = 1 - u - v;
+
+    // Initialize hit info
+    Hit hit;
+    hit.hit = determinant >= 1E-6 && dst >= 0 && u >= 0 && v >= 0 && w >= 0;
+    hit.hitPoint = ray.origin + ray.dir * dst;
+    hit.normal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v);
+    hit.dst = dst;
+
+    return hit;
+}
+
+Hit intersectBVH(Ray ray)
+{
+    Hit closestHit = (Hit) 0;
+    closestHit.dst = 1.#INF;
+
+    BVHNode stack[64];
+    int stackIndex = 0;
+    stack[stackIndex++] = bvhBuffer[0];
+
+    while (stackIndex > 0)
+    {
+        BVHNode node = stack[--stackIndex];
+
+        if (node.triangleCount > 0) // no children
+        {
+            for (int i = 0; i < node.triangleCount; i++)
+            {
+                Triangle tri = triangleBuffer[i + node.index];
+                Hit hit = intersectTriangle(ray, tri);
+
+                if (hit.hit && hit.dst < closestHit.dst) 
+                {
+                    closestHit = hit;
+                }
+            }
+        }
+        else
+        {
+            stack[stackIndex++] = bvhBuffer[node.index + 0];
+            stack[stackIndex++] = bvhBuffer[node.index + 1];
+        }
+    }
+
+    return closestHit;
+}
+
+[numthreads(3,3,1)]
+void CSMain (uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int listenerIndex = gtid.x - 1;
+    int sourceIndex = gtid.y - 1;
+    float3 sourcePos = sourceBuffer[gid.x].position;
+
+    float3 offsetL = normalize(cross(sourcePos - listenerPos, float3(0.0, 1.0, 0.0))) * -listenerOffset;
+    float3 offsetS = normalize(cross(sourcePos - listenerPos, float3(0.0, 1.0, 0.0))) * -sourceOffset;
+
+    Ray ray;
+    ray.origin = (listenerIndex * offsetL) + listenerPos;
+    float3 rayTarget = (sourceIndex * offsetS) + sourcePos - ray.origin; 
+    ray.dir = normalize(rayTarget);
+
+    Hit hit = intersectBVH(ray);
+    if (hit.hit && hit.dst < length(rayTarget))
+    {
+        directResultBuffer[gi + (gid.x * 9)] = 1;
+    }
+    else
+    {
+        directResultBuffer[gi + (gid.x * 9)] = 0;
+    }
+}

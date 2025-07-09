@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1b57d2acff86a0b4d8a37f1f8c2bcdc5, type: 3}
+  m_Name: Industrial Machinery
+  m_EditorClassIdentifier: 
+  absorptionCoefficient110: 0.15
+  scatteringCoefficient110: 0.45
+  absorptionCoefficient630: 0.15
+  scatteringCoefficient630: 0.45
+  absorptionCoefficient3500: 0.1
+  scatteringCoefficient3500: 0.45
+  absorptionCoefficient22050: 0.1
+  scatteringCoefficient22050: 0.45

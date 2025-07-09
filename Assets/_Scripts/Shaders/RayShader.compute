@@ -1,0 +1,694 @@
+// Huuuge Thanks to Sebastian Lague (and his wonderful tutorial on Raytracing!)
+// And his Code => https://github.com/SebLague/Ray-Tracing
+
+#pragma kernel RT
+#pragma kernel ISM
+// #pragma kernel Clear
+
+static const float PI = 3.1415926;
+
+struct Source { //4
+    float3 position;
+    float radius;
+    int mixerIndex;
+};
+
+struct RMaterial { //8
+    float aC1, aC2, aC3, aC4;
+    float sC1, sC2, sC3, sC4;
+};
+
+struct Triangle { //19
+    float3 posA, posB, posC;
+    float3 normalA, normalB, normalC;
+    uint matIndex;
+};
+
+struct RMesh { //2
+    uint firstTriangleIndex;
+    uint numTriangles;
+};
+
+struct Ray { //6
+    float3 origin;
+    float3 dir;
+};
+
+struct Hit { //10
+    bool hit;
+    float dst;
+    float3 hitPoint;
+    float3 normal;
+    uint sourceIndex;
+    uint matIndex;
+};
+
+struct EnergyBand {
+    float e1, e2, e3, e4;
+};
+
+struct RayData { //7
+    uint directionIndex;
+    uint sourceIndex;
+    EnergyBand energy;
+    float distance;
+};
+
+struct BVHNode { //8
+    float3 min;
+    float3 max;
+    int index;
+    int triangleCount;
+};
+
+struct ImageSource {
+    float3 position;
+    int valid;
+};
+
+// inputs
+StructuredBuffer<float3> directionBuffer;
+StructuredBuffer<Triangle> triangleBuffer;
+StructuredBuffer<RMesh> meshBuffer;
+StructuredBuffer<Source> sourceBuffer;
+StructuredBuffer<BVHNode> bvhBuffer;
+StructuredBuffer<RMaterial> materialBuffer;
+StructuredBuffer<ImageSource> imageSourceBuffer;
+int numMeshes;
+int numSources;
+int numBVHNodes;
+int numRays;
+int numTriangles;
+int maxRayDepth;
+int frame;
+bool useBVH;
+bool useVBS;
+bool useRAIN;
+float airAbsorptionsCoefficient;
+float energyThreshold;
+float energyRatio;
+float3 listenerPos;
+
+float sampleRate;
+float speedOfSound;
+int numBins;
+bool genHisto;
+
+// outputs
+AppendStructuredBuffer<RayData> rayDataBuffer;
+// RWStructuredBuffer<EnergyBand> histogramBuffer;
+
+Hit intersectSource(Ray ray, Source source)
+{
+    Hit hit = (Hit) 0;
+
+    float3 oc = ray.origin - source.position;
+    if (length(oc) <= source.radius) return hit;
+    
+    float a = dot(ray.dir, ray.dir);
+    float b = 2 * dot(oc, ray.dir);
+    float c = dot(oc, oc) - source.radius * source.radius;
+    float h = b * b - 4 * a * c;
+    
+    if (h >= 0) 
+    {
+        float dst = (-b - sqrt(h)) / (2 * a);
+
+        if (dst >= 0) 
+        {
+            hit.hit = true;
+            hit.dst = dst;
+            hit.hitPoint = ray.origin + ray.dir * dst;
+            hit.normal = normalize(hit.hitPoint - source.position);
+        }
+    }
+    return hit;
+}
+
+Hit intersectSources(Ray ray) 
+{
+    Hit closestHit = (Hit) 0;
+    closestHit.dst = 1.#INF;
+
+    for (int i = 0; i < numSources; i++)
+    {
+        Source source = sourceBuffer[i];
+        Hit hit = intersectSource(ray, source);
+
+        if (hit.hit && hit.dst < closestHit.dst)
+        {
+            closestHit = hit;
+            closestHit.sourceIndex = i;
+        }
+    }
+
+    return closestHit;
+}
+
+// Möller–Trumbore algorithm
+Hit intersectTriangle(Ray ray, Triangle tri)
+{
+    float3 edgeAB = tri.posB - tri.posA;
+    float3 edgeAC = tri.posC - tri.posA;
+    float3 normalVector = cross(edgeAB, edgeAC);
+    float3 ao = ray.origin - tri.posA;
+    float3 dao = cross(ao, ray.dir);
+
+    float determinant = -dot(ray.dir, normalVector);
+    float invDet = 1 / determinant;
+
+    // Calculate dst to triangle & barycentric coordinates of intersection point
+    float dst = dot(ao, normalVector) * invDet;
+    float u = dot(edgeAC, dao) * invDet;
+    float v = -dot(edgeAB, dao) * invDet;
+    float w = 1 - u - v;
+
+    // Initialize hit info
+    Hit hit = (Hit) 0;
+    hit.hit = determinant >= 1E-6 && dst >= 0 && u >= 0 && v >= 0 && w >= 0;
+    if (hit.hit)
+    {
+        hit.hitPoint = ray.origin + ray.dir * dst;
+        hit.normal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v);
+        hit.dst = dst;
+        hit.matIndex = tri.matIndex;
+    }
+    return hit;
+}
+
+Hit intersectMesh(Ray ray)
+{
+    Hit closestHit = (Hit) 0;
+    closestHit.dst = 1.#INF;
+
+    for (int meshIndex = 0; meshIndex < numMeshes; meshIndex++)
+    {
+        RMesh mesh = meshBuffer[meshIndex];
+        
+        for (uint i = 0; i < mesh.numTriangles; i++)
+        {
+            int triIndex = mesh.firstTriangleIndex + i;
+            Triangle tri = triangleBuffer[triIndex];
+            Hit hit = intersectTriangle(ray, tri);
+
+            if (hit.hit && hit.dst < closestHit.dst)
+            {
+                closestHit = hit;
+            }
+        }
+    }
+
+    return closestHit;
+}
+
+float intersectAABB(Ray ray, float3 boxMin, float3 boxMax)
+{
+    float3 invDir = float3(
+        abs(ray.dir.x) > 1e-6 ? 1 / ray.dir.x : 1e6,
+        abs(ray.dir.y) > 1e-6 ? 1 / ray.dir.y : 1e6,
+        abs(ray.dir.z) > 1e-6 ? 1 / ray.dir.z : 1e6
+    );
+
+    float3 tMin = (boxMin - ray.origin) * invDir;
+    float3 tMax = (boxMax - ray.origin) * invDir;
+    float3 t1 = min(tMin, tMax);
+    float3 t2 = max(tMin, tMax);
+    float dstFar = min(min(t2.x, t2.y), t2.z);
+    float dstNear = max(max(t1.x, t1.y), t1.z);
+
+    bool hit = dstFar >= dstNear && dstFar > 0;
+    return hit ? dstNear : 1.#INF;
+}
+
+Hit intersectBVH(Ray ray)
+{
+    Hit closestHit = (Hit) 0;
+    closestHit.dst = 1.#INF;
+
+    int stack[64];
+    int stackIndex = 0;
+    stack[stackIndex++] = 0;
+
+    while (stackIndex > 0)
+    {
+        BVHNode node = bvhBuffer[stack[--stackIndex]];
+
+        if (node.triangleCount > -1) // no children
+        {
+            for (int i = 0; i < node.triangleCount; i++)
+            {
+                Triangle tri = triangleBuffer[i + node.index];
+                Hit hit = intersectTriangle(ray, tri);
+
+                if (hit.hit && hit.dst < closestHit.dst) 
+                {
+                    closestHit = hit;
+                }
+            }
+        }
+        else
+        {
+            int childIndexA = node.index + 0;
+            int childIndexB = node.index + 1;
+
+            BVHNode childA = bvhBuffer[childIndexA];
+            BVHNode childB = bvhBuffer[childIndexB];
+
+            float dstA = intersectAABB(ray, childA.min, childA.max);
+            float dstB = intersectAABB(ray, childB.min, childB.max);
+
+            bool isNearestA = dstA <= dstB;
+            float dstNear = isNearestA ? dstA : dstB;
+            float dstFar = isNearestA ? dstB : dstA;
+
+            int childIndexNear = isNearestA ? childIndexA : childIndexB;
+            int childIndexFar = isNearestA ? childIndexB : childIndexA;
+
+            if (dstFar < closestHit.dst) stack[stackIndex++] = childIndexFar;
+            if (dstNear < closestHit.dst) stack[stackIndex++] = childIndexNear;
+        }
+    }
+
+    return closestHit;
+}
+
+bool isSourceVisible(float3 hitpoint, float3 directionToSource, float distanceToSource)
+{
+    Ray ray;
+    ray.origin = hitpoint; 
+    ray.dir = directionToSource;
+
+    Hit hit;
+    if (useBVH) 
+    {
+        hit = intersectBVH(ray);
+    } 
+    else 
+    {
+        hit = intersectMesh(ray);
+    }
+
+    return !hit.hit || hit.dst >= distanceToSource;
+}
+
+float computeScatteredEnergy(float energy, float scatterCoefficient, float absorptionCoefficient, 
+    float gamma, float theta)
+{
+    float gammaTerm = 1.0 - cos(gamma / 2.0);
+    float thetaTerm = 2.0 * cos(theta);
+    return energy * scatterCoefficient * (1.0 - absorptionCoefficient) * gammaTerm * thetaTerm;
+}
+
+EnergyBand computeScatteredEnergy(EnergyBand input, uint matIndex, float gamma, float theta)
+{
+    RMaterial material = materialBuffer[matIndex];
+    EnergyBand result;
+    float gammaTerm = 1.0 - cos(gamma / 2.0);
+    float thetaTerm = 2.0 * cos(theta);
+    result.e1 = input.e1 * material.sC1 * (1.0 - material.aC1) * gammaTerm * thetaTerm;
+    result.e2 = input.e2 * material.sC2 * (1.0 - material.aC2) * gammaTerm * thetaTerm;
+    result.e3 = input.e3 * material.sC3 * (1.0 - material.aC3) * gammaTerm * thetaTerm;
+    result.e4 = input.e4 * material.sC4 * (1.0 - material.aC4) * gammaTerm * thetaTerm;
+    return result;
+}
+
+float airAbsorption(float energy, float dst)
+{
+    return energy * exp(-dst * airAbsorptionsCoefficient);
+}
+
+EnergyBand airAbsorption(EnergyBand input, float dst)
+{
+    EnergyBand result;
+    result.e1 = input.e1 * exp(-dst * airAbsorptionsCoefficient);
+    result.e2 = input.e2 * exp(-dst * airAbsorptionsCoefficient);
+    result.e3 = input.e3 * exp(-dst * airAbsorptionsCoefficient);
+    result.e4 = input.e4 * exp(-dst * airAbsorptionsCoefficient);
+    return result;
+}
+
+float materialAbsorption(float energy, uint matIndex)
+{
+    return energy - energy * materialBuffer[matIndex].aC4;
+}
+
+EnergyBand materialAbsorption(EnergyBand input, uint matIndex)
+{
+    EnergyBand result;
+    RMaterial material = materialBuffer[matIndex];
+    result.e1 = input.e1 - input.e1 * material.aC1;
+    result.e2 = input.e2 - input.e2 * material.aC2;
+    result.e3 = input.e3 - input.e3 * material.aC3;
+    result.e4 = input.e4 - input.e4 * material.aC4;
+    return result;
+}
+
+EnergyBand proportionalDistance(EnergyBand input, float dst)
+{
+    EnergyBand result;
+    result.e1 = input.e1 / dst;
+    result.e2 = input.e2 / dst;
+    result.e3 = input.e3 / dst;
+    result.e4 = input.e4 / dst;
+    return result;
+}
+
+float rand(uint seed)
+{
+    seed = (seed << 13u) ^ seed;
+    return (1.0 - float((seed * (seed * seed * 15731u + 789221u) + 1376312589u) & 0x7fffffff) / 2147483648.0);
+}
+
+float3 randLambertDir(uint seed, float3 normal)
+{
+    float r1 = rand(seed);
+    float r2 = rand(seed);
+
+    float phi = 2.0 * PI * r1;
+    float r = sqrt(r2);
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(1.0 - r2);
+    
+    // Lokaler Sample-Vektor im Tangentialraum (x,y,z)
+    float3 sample = float3(x, y, z);
+    
+    // Erzeuge ein Orthonormalsystem (Tangent, Bitangent, Normal)
+    float3 tangent;
+    if (abs(normal.x) > abs(normal.z)) tangent = normalize(float3(-normal.y, normal.x, 0.0));
+    else tangent = normalize(float3(0.0, -normal.z, normal.y));
+    
+    float3 bitangent = cross(normal, tangent);
+    float3 worldDir = sample.x * tangent + sample.y * bitangent + sample.z * normal;
+    
+    return normalize(worldDir);
+}
+
+// PCG (permuted congruential generator). Thanks to:
+// www.pcg-random.org and www.shadertoy.com/view/XlGcRh
+uint nextRandom(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result;
+}
+
+float randomValue(inout uint state)
+{
+    return nextRandom(state) / 4294967295.0; // 2^32 - 1
+}
+
+// Random value in normal distribution (with mean=0 and sd=1)
+float randomValueNormalDistribution(inout uint state)
+{
+    // Thanks to https://stackoverflow.com/a/6178290
+    float theta = 2 * 3.1415926 * randomValue(state);
+    float rho = sqrt(-2 * log(randomValue(state)));
+    return rho * cos(theta);
+}
+
+// Calculate a random direction
+float3 randomDirection(inout uint state)
+{
+    // Thanks to https://math.stackexchange.com/a/1585996
+    float x = randomValueNormalDistribution(state);
+    float y = randomValueNormalDistribution(state);
+    float z = randomValueNormalDistribution(state);
+    return normalize(float3(x, y, z));
+}
+
+float3 randomDirectionHemisphere(inout uint state, float3 normal)
+{
+    float3 dir = randomDirection(state);
+    if (dot(dir, normal) < 0)
+    {
+        dir = -dir;
+    }
+    return dir;
+}
+
+float3 scatterRay(float3 incident, float3 normal, float scatterCoefficient, uint rngState)
+{
+    float3 specular = incident - 2 * dot(incident, normal) * normal;
+    float3 diffuse = normalize(randomDirectionHemisphere(rngState, normal));
+    return scatterCoefficient * diffuse + (1-scatterCoefficient) * specular;
+}
+
+float3 reflectRay(float3 incident, float3 normal)
+{
+    return incident - 2 * dot(incident, normal) * normal;
+}
+
+bool isNaN(float x) {
+    return x != x;
+}
+
+bool isInf(float x) {
+    return x == 1.#INF || x == -1.#INF;
+}
+
+bool isValidEnergy(EnergyBand energy) {
+    return !isNaN(energy.e1) && !isInf(energy.e1) &&
+           !isNaN(energy.e2) && !isInf(energy.e2) &&
+           !isNaN(energy.e3) && !isInf(energy.e3) &&
+           !isNaN(energy.e4) && !isInf(energy.e4) &&
+           energy.e1 >= 0.0 && energy.e1 <= 1.0 &&
+           energy.e2 >= 0.0 && energy.e2 <= 1.0 &&
+           energy.e3 >= 0.0 && energy.e3 <= 1.0 &&
+           energy.e4 >= 0.0 && energy.e4 <= 1.0 &&
+           energy.e1 > energyThreshold && 
+           energy.e2 > energyThreshold && 
+           energy.e3 > energyThreshold && 
+           energy.e4 > energyThreshold;
+    // Handle invalid energy... otherwise: big audio-errors and lots of headache..
+}
+
+[numthreads(32, 1, 1)]
+void RT(uint3 id : SV_DispatchThreadID) // Calculate for each direction
+{
+    uint index = id.x;
+    uint rngState = index + frame * 719393;
+
+    // Init Ray
+    Ray ray; 
+    ray.origin = listenerPos;
+    ray.dir = directionBuffer[index];
+
+    // Init RayData 
+    RayData rayData;
+    rayData.directionIndex = index;
+    rayData.distance = 0.0;
+
+    // Init Energy
+    float initialEnergy = 1.0/(float)numRays;
+    EnergyBand energy;
+    energy.e1 = initialEnergy;
+    energy.e2 = initialEnergy;
+    energy.e3 = initialEnergy;
+    energy.e4 = initialEnergy;
+
+    for (int depth = 0; depth < maxRayDepth; depth++)
+    {
+        // Raycast
+        Hit hitSource = intersectSources(ray);
+        Hit hitGeometry;
+        if (useBVH) hitGeometry = intersectBVH(ray);
+        else hitGeometry = intersectMesh(ray);
+
+        // Geometry vs Source
+        if (!hitSource.hit && !hitGeometry.hit) break; // Nothing
+        else 
+        {
+            if (depth > 1)
+            {
+                for (int i = 0; i < numSources; i++) 
+                {
+                    if ((!hitSource.hit || hitSource.dst >= hitGeometry.dst)) break;
+                    
+                    energy = airAbsorption(energy, hitSource.dst);
+                    if (!isValidEnergy(energy)) break;
+    
+                    // save and sound
+                    rayData.sourceIndex = hitSource.sourceIndex;
+                    rayData.distance += hitSource.dst;
+                    rayData.energy = energy;
+                    rayDataBuffer.Append(rayData);
+
+                    // Histogram Alternative
+                    // if (genHisto)
+                    // {
+                    //     float arrivalTime = rayData.distance / speedOfSound;
+                    //     int binIndex = round(arrivalTime * sampleRate);
+                    //     if (binIndex >= numBins) continue;
+                    //     histogramBuffer[binIndex + hitSource.sourceIndex * numBins].e1 += energy.e1;
+                    //     histogramBuffer[binIndex + hitSource.sourceIndex * numBins].e2 += energy.e2;
+                    //     histogramBuffer[binIndex + hitSource.sourceIndex * numBins].e3 += energy.e3;
+                    //     histogramBuffer[binIndex + hitSource.sourceIndex * numBins].e4 += energy.e4;
+                    // }
+    
+                    // continue tracing
+                    ray.origin = hitSource.hitPoint + 1e-4 * ray.dir; // just-in-case-offset
+                    hitSource = intersectSources(ray);
+                }
+            }
+
+            if (hitGeometry.hit) // Geometry
+            {
+                rayData.distance += hitGeometry.dst;
+
+                // Diffuse Rain
+                if (useRAIN && materialBuffer[hitGeometry.matIndex].sC4 > 0 || materialBuffer[hitGeometry.matIndex].sC3 > 0 || materialBuffer[hitGeometry.matIndex].sC2 > 0 || materialBuffer[hitGeometry.matIndex].sC1 > 0)
+                {
+                    for (int i = 0; i < numSources; i++)
+                    {
+                        Source source = sourceBuffer[i];
+    
+                        float3 directionToSource = normalize(source.position - hitGeometry.hitPoint);
+                        float distanceToSource = length(source.position - hitGeometry.hitPoint);
+    
+                        if (isSourceVisible(hitGeometry.hitPoint, directionToSource, distanceToSource))
+                        {
+                            float gamma = asin(source.radius / distanceToSource);
+                            float theta = acos(dot(directionToSource, hitGeometry.normal));
+    
+                            EnergyBand scatteredEnergy = computeScatteredEnergy(
+                                energy, 
+                                hitGeometry.matIndex, 
+                                gamma, 
+                                theta
+                            );
+
+                            if (!isValidEnergy(scatteredEnergy)) continue;
+    
+                            RayData rayDataScat;
+                            rayDataScat.directionIndex = index;
+                            rayDataScat.sourceIndex = i;
+                            rayDataScat.energy = scatteredEnergy;
+                            rayDataScat.distance = rayData.distance + distanceToSource;
+
+                            rayDataBuffer.Append(rayDataScat);
+
+                            // Histogram Alternative
+                            // if (genHisto)
+                            // {
+                            //     float distance = rayData.distance + distanceToSource;
+                            //     float arrivalTime = distance / speedOfSound;
+                            //     int binIndex = (int) (arrivalTime * sampleRate);
+                            //     if (binIndex >= numBins) continue;
+                            //     histogramBuffer[binIndex + i * numBins].e1 += energy.e1;
+                            //     histogramBuffer[binIndex + i * numBins].e2 += energy.e2;
+                            //     histogramBuffer[binIndex + i * numBins].e3 += energy.e3;
+                            //     histogramBuffer[binIndex + i * numBins].e4 += energy.e4;
+                            // }
+    
+                            energy.e1 -= scatteredEnergy.e1;
+                            energy.e2 -= scatteredEnergy.e2;
+                            energy.e3 -= scatteredEnergy.e3;
+                            energy.e4 -= scatteredEnergy.e4;
+                        }
+                    }
+                }
+
+                // reflect ray and so on..
+                energy = materialAbsorption(energy, hitGeometry.matIndex);
+                energy = airAbsorption(energy, hitGeometry.dst);
+
+                if (!isValidEnergy(energy)) break;
+                
+                ray.origin = hitGeometry.hitPoint;
+
+                if (useVBS)
+                {
+                    // get average scatteringCoefficient
+                    float sCAverage = materialBuffer[hitGeometry.matIndex].sC1
+                                    + materialBuffer[hitGeometry.matIndex].sC2
+                                    + materialBuffer[hitGeometry.matIndex].sC3
+                                    + materialBuffer[hitGeometry.matIndex].sC4 
+                                    / 4.0;
+                    ray.dir = scatterRay(ray.dir, hitGeometry.normal, materialBuffer[hitGeometry.matIndex].sC2, (id.x + hitGeometry.hitPoint.y - hitGeometry.hitPoint.z));
+                }
+                else
+                {
+                    ray.dir = reflectRay(ray.dir, hitGeometry.normal);
+                }
+            }
+            else break;
+        }
+    }
+}
+
+[numthreads(32, 1, 1)]
+void ISM(uint3 id : SV_DispatchThreadID) // Calculate for each triangle
+{
+    uint triangleIndex = id.x;
+
+    if (triangleIndex >= (uint) numTriangles) return;
+    
+    Triangle tri = triangleBuffer[triangleIndex];
+    
+    for (int i = 0; i < numSources; i++) // Calculate for each source
+    {
+        ImageSource imageSource = imageSourceBuffer[triangleIndex + i * numTriangles];
+        if (imageSource.valid < 0) return;
+
+        Ray raySeg1; // Listener -> Hit Point
+        raySeg1.origin = listenerPos;
+        raySeg1.dir = normalize(imageSource.position - raySeg1.origin);
+        Hit hitReflector = intersectTriangle(raySeg1, tri);
+        
+        if (hitReflector.hit)
+        {
+            // Segment 1
+            Hit hitGeometry1;
+            if (useBVH) hitGeometry1 = intersectBVH(raySeg1);
+            else hitGeometry1 = intersectMesh(raySeg1);
+    
+            if (hitReflector.dst > hitGeometry1.dst) return;
+    
+            // Segment 2
+            float3 seg2 = sourceBuffer[i].position - hitReflector.hitPoint;
+            Ray raySeg2; // Hit Point -> Source
+            raySeg2.origin = hitReflector.hitPoint;
+            raySeg2.dir = normalize(seg2);
+    
+            Hit hitGeometry2;
+            if (useBVH) hitGeometry2 = intersectBVH(raySeg2);
+            else hitGeometry2 = intersectMesh(raySeg2);
+    
+            if (length(seg2) > hitGeometry2.dst) return;
+    
+            float initialEnergy = 1.0 / energyRatio; // User dependant energyRatio
+            EnergyBand energy;
+            energy.e1 = initialEnergy;
+            energy.e2 = initialEnergy;
+            energy.e3 = initialEnergy;
+            energy.e4 = initialEnergy;
+    
+            float totalDistance = hitReflector.dst + length(seg2);
+    
+            energy = materialAbsorption(energy, hitReflector.matIndex);
+            energy = airAbsorption(energy, totalDistance);
+            energy = proportionalDistance(energy, totalDistance);
+    
+            if (!isValidEnergy(energy)) return;
+
+            RayData rayData;
+            rayData.directionIndex = 0; // no information on direction is given
+            rayData.sourceIndex = i;
+            rayData.energy = energy;
+            rayData.distance = totalDistance;
+    
+            rayDataBuffer.Append(rayData);
+        }
+    }
+}
+
+// [numthreads(32, 1, 1)]
+// void Clear(uint3 id : SV_DispatchThreadID)
+// {
+//     histogramBuffer[id.x].e1 = 0.0; // Clear the buffer to 0
+//     histogramBuffer[id.x].e2 = 0.0; // Clear the buffer to 0
+//     histogramBuffer[id.x].e3 = 0.0; // Clear the buffer to 0
+//     histogramBuffer[id.x].e4 = 0.0; // Clear the buffer to 0
+// }

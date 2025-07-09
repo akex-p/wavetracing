@@ -1,0 +1,74 @@
+// Kerneldefinition
+#pragma kernel SimulateWave
+
+// buffers
+StructuredBuffer<float> waveBufferPrev;
+RWStructuredBuffer<float> waveBufferNext;
+StructuredBuffer<int> nodeTypeBuffer;
+RWStructuredBuffer<float> listenerOutputBuffer;
+
+// parameters
+float d1;
+float timeStep;
+uint gridSize;
+
+int GetIndex(int x, int y, int z) {
+    return x + y * gridSize + z * gridSize * gridSize;
+}
+
+[numthreads(8, 8, 8)]
+void SimulateWave(uint3 id : SV_DispatchThreadID)
+{
+    int index = GetIndex(id.x, id.y, id.z);
+
+    int nodeType = nodeTypeBuffer[index];
+
+    switch (nodeType) {
+        case 0: // "Normal Node"
+        {
+            float axialSum =
+            waveBufferPrev[GetIndex(id.x + 1, id.y, id.z)] +
+            waveBufferPrev[GetIndex(id.x - 1, id.y, id.z)] +
+            waveBufferPrev[GetIndex(id.x, id.y + 1, id.z)] +
+            waveBufferPrev[GetIndex(id.x, id.y - 1, id.z)] +
+            waveBufferPrev[GetIndex(id.x, id.y, id.z + 1)] +
+            waveBufferPrev[GetIndex(id.x, id.y, id.z - 1)];
+
+            waveBufferNext[index] = d1 * axialSum - waveBufferNext[index];
+            break;
+        }
+        case 1: // Boundary-Node (Absorption)
+        {
+            waveBufferNext[index] = 0.0; // wave vanishes completely
+            break;
+            
+        }
+        case 2: // Source-Node => NOW: just a normal sinus
+        {
+            waveBufferNext[index] = sin(timeStep * 10);
+            break;
+        }
+        case 3: // Listener-Node
+        {
+            float axialSum =
+            waveBufferPrev[GetIndex(id.x + 1, id.y, id.z)] +
+            waveBufferPrev[GetIndex(id.x - 1, id.y, id.z)] +
+            waveBufferPrev[GetIndex(id.x, id.y + 1, id.z)] +
+            waveBufferPrev[GetIndex(id.x, id.y - 1, id.z)] +
+            waveBufferPrev[GetIndex(id.x, id.y, id.z + 1)] +
+            waveBufferPrev[GetIndex(id.x, id.y, id.z - 1)];
+
+            waveBufferNext[index] = d1  * axialSum - waveBufferNext[index];
+
+            listenerOutputBuffer[index] = waveBufferNext[index];
+            break;
+        }
+        default: // otherwise: ignore
+        {
+            waveBufferNext[index] = waveBufferPrev[index];
+            break;
+        }
+    }
+    
+}
+
